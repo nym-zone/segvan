@@ -64,6 +64,8 @@
 
 #include <regex.h>
 
+#include <err.h>
+
 #include "secp256k1/include/secp256k1.h"
 
 #include "segwit_addr.h"
@@ -111,6 +113,24 @@ static unsigned char wifvmask = 0xff;
  * when threading support is added.
  */
 static secp256k1_context *secp256k1ctx = NULL;
+
+/*
+ * These values will eventually be used to configure threads in some fashion.
+ * Therefore, they should be global.
+ *
+ * 64 == sizeof(secp256k1_pubkey).  It needs to be hardcoded for an initializer.
+ * 32 is the size of a private key.
+ *
+ * By default, this will use 12582912 bytes of memory per thread for
+ * keygrinding scratch space (not including other overhead).  I set it
+ * conservatively to avoid malloc() failures.  Users with big RAM may
+ * kick it up a few orders of magnitude.
+ *
+ * XXX:  Is there any cryptographic limit on how many keys are safe to
+ * grind in one run?
+ */
+#define	KEYGRIND_TUPLE	(32 + 64)
+static size_t global_memhint = 131072 * KEYGRIND_TUPLE;
 
 static int stopme = 0;
 static int tellme = 0;
@@ -278,6 +298,20 @@ b58chk_enc(char *b58, size_t *b58sz, const void *ver, size_t verlen,
 	free(buf);
 
 	return (error);
+}
+
+static void
+pkobjtohash(void *h160 /*[20]*/, const secp256k1_pubkey *pubkey)
+{
+	unsigned char serpubkey[33];
+	size_t keylen;
+
+	keylen = sizeof(serpubkey); /* 33 */
+	secp256k1_ec_pubkey_serialize(secp256k1ctx,
+		serpubkey, &keylen, pubkey, SECP256K1_EC_COMPRESSED);
+	assert(keylen == sizeof(serpubkey));
+
+	hash160(h160, serpubkey, keylen);
 }
 
 static int
@@ -482,6 +516,14 @@ selftest(void)
 }
 #endif /*LCRYPTO_OPS*/
 
+/*
+ * This function is frighteningly long and deeply-nested.  Sorry.
+ *
+ * I repeatedly tried to lift parts out into separate functions.  A tiny
+ * bit could be done there, with the output on match.  Otherwise, there
+ * really isn't much which could be lifted cleanly out of the loop without
+ * a strong likelihood of killing performance.
+ */
 static int
 mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 	int (**afunc)(char*, size_t*, char*, size_t*, const void*, const void*),
@@ -498,10 +540,13 @@ mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 	struct timespec ts[2];
 	double times[2];
 
-	unsigned char skbuf[32], h160[20];
+	unsigned char skbuf[32], *sk, h160[20];
 	char addr[NTYPES][128], wif[NTYPES][128];
 	unsigned nmatch;
-	size_t addrsz, wifsz;
+	size_t addrsz, wifsz, ngrind;
+
+	secp256k1_pubkey *pubs = NULL;
+	unsigned char (*privs)[32] = NULL;
 
 	assert(sizeof(addr[0]) == 128);
 
@@ -509,6 +554,18 @@ mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 		return (0);
 	else if (nsearch > sizeof(preg)/sizeof(*preg))
 		return (-1);
+
+	/* Yes, round *down*: */
+	ngrind = global_memhint / KEYGRIND_TUPLE;
+
+	pubs = malloc(ngrind * sizeof(*pubs));
+	if (pubs == NULL)
+		err(2, "malloc() failed for grinding pubkeys");
+
+	assert(sizeof(*privs) == 32);
+	privs = malloc(ngrind * sizeof(*privs));
+	if (privs == NULL)
+		err(2, "malloc() failed for grinding privkeys");
 
 	for (int i = 0; i < nsearch; ++i) {
 		error = regcomp(&preg[i], regex[i],
@@ -536,97 +593,119 @@ mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 	/*}*/
 
 	while (!stopme) {
-		nmatch = 0;
-
 		rbytes = read(rndfd, skbuf, 32);
-		if (rbytes != 32)
+		if (rbytes != 32) {
+			warn("read() off /dev/urandom returned %jd (should be 32)", (intmax_t)rbytes);
 			return (4);
-
-		mkpubkey(h160, skbuf);
-
-		for (int i = 0, j = 0; i < nsearch; ++i) {
-			addrsz = sizeof(addr[0]), wifsz = sizeof(wif[0]);
-			error = afunc[i](addr[nmatch], &addrsz, wif[nmatch],
-				&wifsz, h160, skbuf);
-
-			if (error) {
-				error = -1;
-				goto end;
-			}
-
-			/*
-			 * XXX: ad hoc hardcode of desired feature
-			 * Only for old-style addresses; but it's cheap, and
-			 * it will not affect Bech32 Witness v0 addresses.
-			 */
-			if (strlen(addr[nmatch]) < 32) {
-				++nmatch;
-				continue;
-			}
-
-			/*error = regexec(&preg[i], addr, 0, NULL, 0);*/
-			error = regexec(&preg[i], addr[nmatch],
-				preg[i].re_nsub + 1, pmatch, 0);
-
-			if (!error)
-				++nmatch;
-			else if (error != REG_NOMATCH) {
-				fprintf(stderr, "Unknown regex error\n");
-				error = -1;
-				goto end;
-			}
 		}
 
-		if (nmatch > 0) {
-			if (nmatch == 1) {
-				printf("%s\t%s\n", addr[0], wif[0]);
-				notify(addr[0]);
-			} else {
-				char *prnbuf, *cur;
-				size_t prnbuflen = 0, len;
+		/*mkpubkey(h160, skbuf);*/
 
-				for (int i = 0; i < nmatch; ++i)
-					prnbuflen += 1 + strlen(addr[i]) + 1 +
-						strlen(wif[i]) + 1;
+		/* Ignore compiler warning on privs: */
+		error = secp256k1_ec_grind(secp256k1ctx, pubs, privs, ngrind,
+			skbuf, NULL);
+		/* Inverted errors: */
+		if (error != 1)
+			abort();
 
-				prnbuf = malloc(prnbuflen);
-				if (prnbuf == NULL)
-					abort(); /* XXX FIXME */
+		for (size_t h = 0; h < ngrind; ++h) {
+			nmatch = 0;
 
-				cur = prnbuf, len = prnbuflen;
-				for (int i = 0; i < nmatch; ++i) {
+			pkobjtohash(h160, &pubs[h]);
+			sk = privs[h];
+
+			for (int i = 0; i < nsearch; ++i) {
+				addrsz = sizeof(addr[0]),wifsz = sizeof(wif[0]);
+				error = afunc[i](addr[nmatch], &addrsz,
+					wif[nmatch], &wifsz, h160, sk);
+
+				if (error) {
+					error = -1;
+					goto end;
+				}
+
+				/*
+				 * XXX: ad hoc hardcode of desired feature
+				 * Only for old-style addresses; but it's cheap,
+				 * and it will not affect Bech32 Witness v0
+				 * addresses.
+				 */
+				if (strlen(addr[nmatch]) < 32) {
+					++nmatch;
+					continue;
+				}
+
+				/*error = regexec(&preg[i], addr, 0, NULL, 0);*/
+				error = regexec(&preg[i], addr[nmatch],
+					preg[i].re_nsub + 1, pmatch, 0);
+
+				if (!error)
+					++nmatch;
+				else if (error != REG_NOMATCH) {
+					fprintf(stderr,"Unknown regex error\n");
+					error = -1;
+					goto end;
+				}
+			}
+
+			++ctr;
+
+			if (nmatch > 0) {
+				if (nmatch == 1) {
+					printf("%s\t%s\n", addr[0], wif[0]);
+					notify(addr[0]);
+				} else {
+					char *prnbuf, *cur;
+					size_t prnbuflen = 0, len;
+
+					for (int i = 0; i < nmatch; ++i)
+						prnbuflen += 1 +
+							strlen(addr[i]) + 1 +
+							strlen(wif[i]) + 1;
+
+					prnbuf = malloc(prnbuflen);
+					if (prnbuf == NULL)
+						abort(); /* XXX FIXME */
+
+					cur = prnbuf, len = prnbuflen;
+					for (int i = 0; i < nmatch; ++i) {
 					int wbytes; /*yes, it returns int :-( */
 
 					wbytes = snprintf(cur, len, ":%s\t%s\t",
 						addr[i], wif[i]);
 					cur += wbytes, len -= wbytes;
+					}
+					/*
+					 * According to cstd, snprintf() must
+					 * discard the last tab:
+					 */
+					assert(prnbuf[prnbuflen - 1] == '\0');
+
+					printf("%s\n", prnbuf);
+
+					cur = prnbuf, len = prnbuflen;
+					for (int i = 0; i < nmatch; ++i) {
+						int wbytes;
+
+						wbytes = snprintf(cur, len,
+							":%s\t", addr[i]);
+						cur += wbytes, len -= wbytes;
+					}
+					/* tab not discarded here: */
+					*(cur - 1) = '\0';
+
+					notify(prnbuf);
+
+					zeroize(prnbuf, prnbuflen);
+					free(prnbuf);
 				}
 				/*
-				 * According to cstd, snprintf() must discard
-				 * the last tab:
+				 * Important:  Not more than one keypair
+				 * from the ground set must ever be used!
 				 */
-				assert(prnbuf[prnbuflen - 1] == '\0');
-
-				printf("%s\n", prnbuf);
-
-				cur = prnbuf, len = prnbuflen;
-				for (int i = 0; i < nmatch; ++i) {
-					int wbytes;
-
-					wbytes = snprintf(cur, len, ":%s\t",
-						addr[i]);
-					cur += wbytes, len -= wbytes;
-				}
-				*(cur - 1) = '\0'; /* tab not discarded here */
-
-				notify(prnbuf);
-
-				zeroize(prnbuf, prnbuflen);
-				free(prnbuf);
+				break;
 			}
 		}
-
-		++ctr;
 
 		if (tellme || (v_flag && stopme) ||
 			(v_flag > 1 && ctr % 10000000 == 0)) {
@@ -646,6 +725,15 @@ mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 end:
 	for (int i = 0; i < nsearch; ++i)
 		regfree(&preg[i]);
+	if (pubs != NULL) {
+		zeroize(pubs, ngrind * sizeof(*pubs));
+		free(pubs);
+	}
+	if (privs != NULL) {
+		zeroize(privs, ngrind * sizeof(*privs));
+		free(privs);
+	}
+	zeroize(skbuf, sizeof(skbuf));
 	return (error);
 }
 
@@ -655,12 +743,15 @@ main(int argc, char *argv[])
 	int ch, error,
 		rndfd = -1,
 		retval = 0,
+		mode = 0,
 		i_flag = 1,
 		T_flag = 0,
 		v_flag = 0,
 		n_nested = 0, n_bech32 = 0, n_oldstyle = 0;
 	const char *nested_regex = NULL, *bech32_regex = NULL,
 		*oldstyle_regex = NULL;
+	char *endptr;
+	long optnum;
 	ssize_t rbytes;
 
 	unsigned char skbuf[32], h160[20];
@@ -668,7 +759,7 @@ main(int argc, char *argv[])
 	char oldaddr[40], bech32[75], wif[64];
 	size_t oldaddrsz, bech32sz, wifsz;
 
-	while ((ch = getopt(argc, argv, "0:1:3:EIN:R:Tb:eir:v")) > -1) {
+	while ((ch = getopt(argc, argv, "0:1:3:EIN:R:Tb:eim:r:v")) > -1) {
 		switch (ch) {
 		case '0':
 			n_oldstyle = atoi(optarg);
@@ -704,6 +795,32 @@ main(int argc, char *argv[])
 		case 'i':
 			i_flag = 1;
 			break;
+		case 'm':
+			errno = 0;
+			optnum = strtol(optarg, &endptr, 10);
+			if (errno != 0)
+				err(1, "Invalid value for -m");
+			else if (optnum <= 0)
+				errx(1, "Invalid value for -m: <= 0");
+			switch (*endptr) {
+			case '\0':
+				break;
+			case 'K': case 'k':
+				optnum *= 1024;		break;
+			case 'M': case 'm':
+				optnum *= 1048576;	break;
+			case 'G': case 'g':
+				optnum *= 1073741824;	break;
+			default:
+				errx(1, "Invalid suffix for -m");
+			}
+			if (endptr[0] != '\0' && endptr[1] != '\0')
+				errx(1, "Invalid value for -m");
+			if (optnum < KEYGRIND_TUPLE)
+				errx(1, "Value for -m is too small");
+			/* XXX: Sanity-check upper bound? No. */
+			global_memhint = optnum;
+			break;
 		case 'r':
 			bech32_regex = optarg;
 			break;
@@ -718,11 +835,16 @@ main(int argc, char *argv[])
 	if (v_flag)
 		setlocale(LC_NUMERIC, "");
 
-	if ((n_nested > 0 || n_bech32 > 0 || n_oldstyle > 0) &&
-		(nested_regex != NULL || bech32_regex != NULL ||
-		oldstyle_regex != NULL)) {
+	/* XXX: magic numbers */
+	mode = (n_nested > 0 || n_bech32 > 0 || n_oldstyle > 0) |
+		((nested_regex != NULL || bech32_regex != NULL ||
+		oldstyle_regex != NULL) << 1);
+
+	if (mode == 0 || mode == 3) {
 		return (1);
 	}
+
+	assert(mode == 1 || mode == 2);
 
 	if (n_nested == 0 && n_bech32 == 0 && n_oldstyle == 0 &&
 		nested_regex == NULL && bech32_regex == NULL &&
@@ -730,7 +852,16 @@ main(int argc, char *argv[])
 		return (0);
 	}
 
-	secp256k1ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+	switch (mode) {
+	case 1:
+		secp256k1ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+		break;
+	case 2:
+		secp256k1ctx = secp256k1_context_create(
+			SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+		break;
+	}
+
 	if (secp256k1ctx == NULL) {
 		fprintf(stderr, "Context creation failure!\n");
 		exit(64);
