@@ -485,7 +485,7 @@ selftest(void)
 static int
 mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 	int (**afunc)(char*, size_t*, char*, size_t*, const void*, const void*),
-	int v_flag)
+	int v_flag, int X_flag)
 {
 #define	NTYPES	3
 	regex_t preg[NTYPES];
@@ -581,6 +581,11 @@ mkvanity(int rndfd, unsigned nsearch, const char **regex, int *i_flag,
 			if (nmatch == 1) {
 				printf("%s\t%s\n", addr[0], wif[0]);
 				notify(addr[0]);
+
+				if (X_flag) {
+					error = 0;
+					goto end;
+				}
 			} else {
 				char *prnbuf, *cur;
 				size_t prnbuflen = 0, len;
@@ -658,6 +663,7 @@ main(int argc, char *argv[])
 		i_flag = 1,
 		T_flag = 0,
 		v_flag = 0,
+		X_flag = 0,
 		n_nested = 0, n_bech32 = 0, n_oldstyle = 0;
 	const char *nested_regex = NULL, *bech32_regex = NULL,
 		*oldstyle_regex = NULL;
@@ -668,7 +674,7 @@ main(int argc, char *argv[])
 	char oldaddr[40], bech32[75], wif[64];
 	size_t oldaddrsz, bech32sz, wifsz;
 
-	while ((ch = getopt(argc, argv, "0:1:3:EIN:R:Tb:eir:v")) > -1) {
+	while ((ch = getopt(argc, argv, "0:1:3:EIN:R:Tb:eir:v:X")) > -1) {
 		switch (ch) {
 		case '0':
 			n_oldstyle = atoi(optarg);
@@ -709,6 +715,9 @@ main(int argc, char *argv[])
 			break;
 		case 'v':
 			++v_flag;
+			break;
+		case 'X':
+			X_flag = 1;
 			break;
 		default:
 			return (1);
@@ -820,7 +829,7 @@ main(int argc, char *argv[])
 				++nsearch;
 
 		assert(nsearch > 0 && nsearch <= 3);
-		mkvanity(rndfd, nsearch, regexes, i_flags, afunc, v_flag);
+		mkvanity(rndfd, nsearch, regexes, i_flags, afunc, v_flag, X_flag);
 	}
 
 	close(rndfd);
