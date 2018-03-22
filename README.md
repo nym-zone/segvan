@@ -6,6 +6,20 @@ By nullius <[nullius@nym.zone](nullius@nym.zone)> ([PGP ECC](https://sks-keyserv
 
 This is an early release of something I more or less whipped up off-the-cuff in December.  It will be improved and documented.  Yes, it will have a manpage (currently half-written).
 
+## Docker
+
+To build the container locally run:
+
+```
+docker build -t segvan .
+```
+
+After the container is built you may run:
+
+```
+docker run -ti segvan segvan -R Test
+```
+
 Development may be encouraged by tips sent to these sample products of this program:
 
 - [bc1q**nullnym**efa273hgss63kvtvr0q7377kjza0607](bitcoin:bc1qnullnymefa273hgss63kvtvr0q7377kjza0607)
