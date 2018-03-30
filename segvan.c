@@ -736,6 +736,25 @@ main(int argc, char *argv[])
 		exit(64);
 	}
 
+	rndfd = open("/dev/urandom", O_RDONLY);
+	if (rndfd < 0)
+		return (2);
+
+	rbytes = read(rndfd, skbuf, 32);
+	if (rbytes != 32)
+		return (4);
+	if (!secp256k1_context_randomize(secp256k1ctx, skbuf)) {
+		fprintf(stderr, "Failed to randomize context!\n");
+		exit(64);
+	}
+
+	signal(SIGINT, catchme);
+#ifndef __linux
+	signal(SIGINFO, inform);
+#else
+	signal(SIGUSR1, inform);
+#endif
+
 	selftest();
 
 	if (T_flag) {
@@ -744,17 +763,6 @@ main(int argc, char *argv[])
 #endif
 		goto done;
 	}
-
-	rndfd = open("/dev/urandom", O_RDONLY);
-	if (rndfd < 0)
-		return (2);
-
-	signal(SIGINT, catchme);
-#ifndef __linux
-	signal(SIGINFO, inform);
-#else
-	signal(SIGUSR1, inform);
-#endif
 
 	while (n_nested-- > 0) {
 		rbytes = read(rndfd, skbuf, 32);
